@@ -65,6 +65,10 @@ local MAX_PRECISE_POOL_SLOTS = 3     -- pooled entries available for precise col
 local POOL = {}
 local CHUNK_INDEX = {}     -- key -> { poolIdx, faceIds = {...}, vertsAdded = N }
 local FIXED_CHUNKS = {}    -- key -> fixed entry record
+local FIXED_FREE = {}      -- stack of reusable fixed entries
+local MAX_FIXED_ENTRIES = 8
+local FIXED_CREATED = 0
+local FIXED_ID_SEQ = 0
 
 local PoolFolder
 local _initialized = false
@@ -370,13 +374,97 @@ end)
 
 -- ---------- Helpers ----------
 local function removeFaces(entry, faceIds)
-	if not entry or not entry.em or not faceIds then return 0 end
-	local removed = 0
-	for _,fid in ipairs(faceIds) do
-		pcall(function() entry.em:RemoveFace(fid) end)
-		removed += 1
-	end
-	return removed
+        if not entry or not entry.em or not faceIds then return 0 end
+        local removed = 0
+        for _,fid in ipairs(faceIds) do
+                pcall(function() entry.em:RemoveFace(fid) end)
+                removed += 1
+        end
+        return removed
+end
+
+local function resetFixedEntry(entry)
+        if not entry then return end
+        if entry.chunkMap then
+                for chunkKey, info in pairs(entry.chunkMap) do
+                        if info and info.faceIds then
+                                removeFaces(entry, info.faceIds)
+                        end
+                        if info and info.lodLevel ~= nil then
+                                decrementPreciseCount(entry, info.lodLevel)
+                        end
+                        entry.chunkMap[chunkKey] = nil
+                end
+        end
+        entry.triCount = 0
+        entry.vertCount = 0
+        entry.collisionFidelity = nil
+        entry.lodLevel = nil
+        entry.preciseCount = 0
+        entry.active = false
+        entry.ownerKey = nil
+        entry.dirty = false
+        entry.applying = false
+        pcall(function()
+                if entry.em and entry.em.RemoveUnused then
+                        entry.em:RemoveUnused()
+                end
+        end)
+end
+
+local function acquireFixedEntry(key)
+        if FIXED_CHUNKS[key] then
+                local entry = FIXED_CHUNKS[key]
+                entry.active = true
+                entry.ownerKey = key
+                if entry.part and entry.part.Parent == nil then
+                        entry.part.Parent = ensureFolder()
+                end
+                entry.part.Name = ("FixedChunk_%s"):format(key)
+                return entry
+        end
+
+        local entry = table.remove(FIXED_FREE)
+        if entry then
+                resetFixedEntry(entry)
+                FIXED_CHUNKS[key] = entry
+                entry.active = true
+                entry.ownerKey = key
+                if entry.part then
+                        entry.part.Name = ("FixedChunk_%s"):format(key)
+                        entry.part.Parent = ensureFolder()
+                end
+                return entry
+        end
+
+        if FIXED_CREATED >= MAX_FIXED_ENTRIES then
+                return nil
+        end
+
+        FIXED_ID_SEQ += 1
+        entry = createFixedEntry(FIXED_ID_SEQ)
+        if not entry then
+                return nil
+        end
+        FIXED_CREATED += 1
+        entry.ownerKey = key
+        entry.part.Name = ("FixedChunk_%s"):format(key)
+        entry.part.Parent = ensureFolder()
+        FIXED_CHUNKS[key] = entry
+        return entry
+end
+
+local function releaseFixedEntry(key, entry)
+        if not entry then return end
+        resetFixedEntry(entry)
+        if entry.part then
+                entry.part.Parent = nil
+                entry.part.Name = ("FixedChunkSlot_%d"):format(entry.slotId or 0)
+        end
+        if key then
+                FIXED_CHUNKS[key] = nil
+        end
+        table.insert(FIXED_FREE, entry)
 end
 
 local function ensureCapsCached(entry)
@@ -490,22 +578,22 @@ local function pickPoolForPrecise(trisNeed, vertsNeed)
 	return nil
 end
 
-local function createFixedEntry(key)
-	local okEm, em = pcall(function()
-		return AssetService:CreateEditableMesh({ FixedSize = true })
-	end)
-	if not okEm or not em then
-		warn("[MeshPool] CreateEditableMesh (fixed) failed: ", tostring(em))
-		return nil
-	end
+local function createFixedEntry(slotId)
+        local okEm, em = pcall(function()
+                return AssetService:CreateEditableMesh({ FixedSize = true })
+        end)
+        if not okEm or not em then
+                warn("[MeshPool] CreateEditableMesh (fixed) failed: ", tostring(em))
+                return nil
+        end
 
-	local part = Instance.new("MeshPart")
-	part.Name = ("FixedChunk_%s"):format(key)
-	part.Anchored = true
-	part.CastShadow = true
-	part.Material = Enum.Material.SmoothPlastic
-	part.Color = FALLBACK_PART_COLOR
-	part.CFrame = CFrame.new()
+        local part = Instance.new("MeshPart")
+        part.Name = ("FixedChunkSlot_%d"):format(slotId)
+        part.Anchored = true
+        part.CastShadow = true
+        part.Material = Enum.Material.SmoothPlastic
+        part.Color = FALLBACK_PART_COLOR
+        part.CFrame = CFrame.new()
 	part.CanCollide = true
 	pcall(function() part.UsePartColor = false end)
 	part.Parent = ensureFolder()
@@ -521,22 +609,78 @@ local function createFixedEntry(key)
 		canSetNormal = nil,
 		canFaceColors = nil,
 		solidCids = {},
-		dirty = false,
-		applying = false,
-		collisionFidelity = nil,
-		isFixed = true,
-		active = true,
-		lodLevel = nil,
-		preciseCount = 0,
-	}
-	return entry
+                dirty = false,
+                applying = false,
+                collisionFidelity = nil,
+                isFixed = true,
+                active = true,
+                lodLevel = nil,
+                preciseCount = 0,
+                slotId = slotId,
+        }
+        return entry
+end
+
+local function acquireFixedEntry(key)
+        if FIXED_CHUNKS[key] then
+                local entry = FIXED_CHUNKS[key]
+                entry.active = true
+                entry.ownerKey = key
+                if entry.part and entry.part.Parent == nil then
+                        entry.part.Parent = ensureFolder()
+                end
+                entry.part.Name = ("FixedChunk_%s"):format(key)
+                return entry
+        end
+
+        local entry = table.remove(FIXED_FREE)
+        if entry then
+                resetFixedEntry(entry)
+                FIXED_CHUNKS[key] = entry
+                entry.active = true
+                entry.ownerKey = key
+                if entry.part then
+                        entry.part.Name = ("FixedChunk_%s"):format(key)
+                        entry.part.Parent = ensureFolder()
+                end
+                return entry
+        end
+
+        if FIXED_CREATED >= MAX_FIXED_ENTRIES then
+                return nil
+        end
+
+        FIXED_ID_SEQ += 1
+        entry = createFixedEntry(FIXED_ID_SEQ)
+        if not entry then
+                return nil
+        end
+        FIXED_CREATED += 1
+        entry.ownerKey = key
+        entry.part.Name = ("FixedChunk_%s"):format(key)
+        entry.part.Parent = ensureFolder()
+        FIXED_CHUNKS[key] = entry
+        return entry
+end
+
+local function releaseFixedEntry(key, entry)
+        if not entry then return end
+        resetFixedEntry(entry)
+        if entry.part then
+                entry.part.Parent = nil
+                entry.part.Name = ("FixedChunkSlot_%d"):format(entry.slotId or 0)
+        end
+        if key then
+                FIXED_CHUNKS[key] = nil
+        end
+        table.insert(FIXED_FREE, entry)
 end
 
 -- ---------- Public API ----------
 function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
-	if not _initialized or #POOL == 0 then
-		MeshPool.init(_lastCfg or { PoolSize = 12, TriCap = 19500 })
-	end
+        if not _initialized or #POOL == 0 then
+                MeshPool.init(_lastCfg or { PoolSize = 12, TriCap = 19500, MaxFixedEntries = 8 })
+        end
 	if type(srcVerts) ~= "table" or #srcVerts == 0 then return false end
 	if type(srcTris)  ~= "table" or #srcTris  == 0 then return false end
 
@@ -556,98 +700,170 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 		end
 	end
 
-	local rec = CHUNK_INDEX[key]
-	if rec and rec.isFixed and not wantFixed then
-		local fixedEntry = rec.entry or FIXED_CHUNKS[key]
-		if fixedEntry then
-			local existing = fixedEntry.chunkMap and fixedEntry.chunkMap[key]
-			if existing and existing.faceIds then
-				removeFaces(fixedEntry, existing.faceIds)
-				decrementPreciseCount(fixedEntry, existing.lodLevel or rec.lodLevel)
-			end
-			FIXED_CHUNKS[key] = nil
-			if fixedEntry.part then fixedEntry.part:Destroy() end
-			pcall(function() if fixedEntry.em then fixedEntry.em:Destroy() end end)
-		end
-		CHUNK_INDEX[key] = nil
-		rec = nil
-	end
+        local rec = CHUNK_INDEX[key]
+        if rec and rec.isFixed and not wantFixed then
+                local fixedEntry = rec.entry or FIXED_CHUNKS[key]
+                if fixedEntry then
+                        releaseFixedEntry(key, fixedEntry)
+                end
+                CHUNK_INDEX[key] = nil
+                rec = nil
+        end
 
-	if wantFixed then
-		if rec and not rec.isFixed then
-			local dynEntry = rec.entry or POOL[rec.poolIdx]
-			if dynEntry then
-				local removedFaces = removeFaces(dynEntry, rec.faceIds)
-				dynEntry.triCount = math.max(0, (dynEntry.triCount or 0) - removedFaces)
-				dynEntry.vertCount = math.max(0, (dynEntry.vertCount or 0) - (rec.vertsAdded or 0))
-				dynEntry.chunkMap[key] = nil
-				recomputeCollisionFidelity(dynEntry)
-				markDirty(dynEntry)
-				decrementPreciseCount(dynEntry, rec.lodLevel)
-			end
-			CHUNK_INDEX[key] = nil
-			rec = nil
-		end
-		local entry = FIXED_CHUNKS[key]
-		if entry and entry.chunkMap and entry.chunkMap[key] and entry.lodLevel ~= nil and lodLevel ~= nil and entry.lodLevel == lodLevel then
-			entry.active = true
-			if entry.part and entry.part.Parent == nil then
-				entry.part.Parent = ensureFolder()
-			end
-			CHUNK_INDEX[key] = {
-				entry = entry,
-				faceIds = entry.chunkMap[key].faceIds,
-				vertsAdded = entry.chunkMap[key].vertsAdded,
-				isFixed = true,
-				lodLevel = entry.lodLevel,
-			}
-			return true
-		end
-		if not entry then
-			entry = createFixedEntry(key)
-			if not entry then
-				return false
-			end
-			FIXED_CHUNKS[key] = entry
-		else
-			local existing = entry.chunkMap and entry.chunkMap[key]
-			if existing and existing.faceIds then
-				removeFaces(entry, existing.faceIds)
-				decrementPreciseCount(entry, existing.lodLevel)
-			end
-			entry.chunkMap[key] = nil
-			entry.triCount = 0
-			entry.vertCount = 0
-			entry.collisionFidelity = nil
-		end
-		ensureCapsCached(entry); ensureFaceIds(entry, opts)
-		local pack, err = addFacesInto(entry)
-		if not pack then
-			warn("[MeshPool] build failed ", err, " for ", key)
-			return false
-		end
-		pack.collisionFidelity = opts.CollisionFidelityTarget
-		entry.triCount = #pack.faceIds
-		entry.vertCount = pack.vertsAdded or 0
-		pack.lodLevel = lodLevel
-		entry.chunkMap[key] = pack
-		entry.lodLevel = lodLevel
-		entry.active = true
-		entry.collisionFidelity = pack.collisionFidelity
-		incrementPreciseCount(entry, lodLevel)
-		if entry.part and entry.part.Parent == nil then
-			entry.part.Parent = ensureFolder()
-		end
-		markDirty(entry)
-		CHUNK_INDEX[key] = {
-			entry = entry,
-			faceIds = pack.faceIds,
-			vertsAdded = pack.vertsAdded,
-			isFixed = true,
-			lodLevel = lodLevel,
-		}
-		return true
-	end
+        if wantFixed and rec and not rec.isFixed then
+                local dynEntry = rec.entry or POOL[rec.poolIdx]
+                if dynEntry then
+                        local removedFaces = removeFaces(dynEntry, rec.faceIds)
+                        dynEntry.triCount = math.max(0, (dynEntry.triCount or 0) - removedFaces)
+                        dynEntry.vertCount = math.max(0, (dynEntry.vertCount or 0) - (rec.vertsAdded or 0))
+                        dynEntry.chunkMap[key] = nil
+                        recomputeCollisionFidelity(dynEntry)
+                        markDirty(dynEntry)
+                        decrementPreciseCount(dynEntry, rec.lodLevel)
+                end
+                CHUNK_INDEX[key] = nil
+                rec = nil
+        end
+
+        local fixedEntry
+        if wantFixed then
+                if rec and rec.isFixed then
+                        fixedEntry = rec.entry or FIXED_CHUNKS[key]
+                else
+                        fixedEntry = acquireFixedEntry(key)
+                end
+                if not fixedEntry then
+                        wantFixed = false
+                end
+        end
+
+        local function addFacesInto(e)
+                local newFaceIds = table.create(trisNeeded)
+                local vertsAdded = 0
+
+                if flatShade then
+                        for _,t in ipairs(srcTris) do
+                                local a,b,c = t[1], t[2], t[3]
+                                local p1,p2,p3 = srcVerts[a], srcVerts[b], srcVerts[c]
+                                if p1 and p2 and p3 then
+                                        local area2 = (p2 - p1):Cross(p3 - p1).Magnitude
+                                        if area2 >= 5e-10 then
+                                                local ok1,v1 = pcall(function() return e.em:AddVertex(p1) end)
+                                                local ok2,v2 = pcall(function() return e.em:AddVertex(p2) end)
+                                                local ok3,v3 = pcall(function() return e.em:AddVertex(p3) end)
+                                                if not (ok1 and ok2 and ok3 and v1 and v2 and v3) then
+                                                        return nil, "vertex_add_failed"
+                                                end
+                                                vertsAdded += 3
+                                                if e.canSetNormal then
+                                                        local n = triNormal(p1,p2,p3)
+                                                        pcall(function()
+                                                                e.em:SetVertexNormal(v1, n); e.em:SetVertexNormal(v2, n); e.em:SetVertexNormal(v3, n)
+                                                        end)
+                                                end
+                                                local okF, fid = pcall(function() return e.em:AddTriangle(v1, v2, v3) end)
+                                                if not (okF and fid) then return nil, "face_add_failed" end
+                                                colorFace(e, fid, p1,p2,p3, opts)
+                                                newFaceIds[#newFaceIds+1] = fid
+                                                if doubleSided then
+                                                        local okB, fidB = pcall(function() return e.em:AddTriangle(v3, v2, v1) end)
+                                                        if okB and fidB then
+                                                                colorFace(e, fidB, p3,p2,p1, opts)
+                                                                newFaceIds[#newFaceIds+1] = fidB
+                                                        else
+                                                                return nil, "face_add_failed"
+                                                        end
+                                                end
+                                        end
+                                end
+                        end
+                else
+                        for _,t in ipairs(srcTris) do
+                                local a,b,c = t[1], t[2], t[3]
+                                local fid, okF = nil, nil
+                                local p1,p2,p3 = srcVerts[a], srcVerts[b], srcVerts[c]
+                                if p1 and p2 and p3 then
+                                        local okAdd, faceId = pcall(function() return e.em:AddTriangle(p1, p2, p3) end)
+                                        if not (okAdd and faceId) then return nil, "face_add_failed" end
+                                        fid = faceId
+                                        colorFace(e, fid, p1,p2,p3, opts)
+                                        newFaceIds[#newFaceIds+1] = fid
+                                        if doubleSided then
+                                                local okB, fidB = pcall(function() return e.em:AddTriangle(p3, p2, p1) end)
+                                                if okB and fidB then
+                                                        colorFace(e, fidB, p3,p2,p1, opts)
+                                                        newFaceIds[#newFaceIds+1] = fidB
+                                                else
+                                                        return nil, "face_add_failed"
+                                                end
+                                        end
+                                end
+                        end
+                end
+
+                return { faceIds = newFaceIds, vertsAdded = vertsAdded }
+        end
+
+        if wantFixed and fixedEntry then
+                if rec and rec.isFixed and fixedEntry.chunkMap and fixedEntry.chunkMap[key] and fixedEntry.lodLevel ~= nil and lodLevel ~= nil and fixedEntry.lodLevel == lodLevel then
+                        fixedEntry.active = true
+                        if fixedEntry.part and fixedEntry.part.Parent == nil then
+                                fixedEntry.part.Parent = ensureFolder()
+                        end
+                        CHUNK_INDEX[key] = {
+                                entry = fixedEntry,
+                                faceIds = fixedEntry.chunkMap[key].faceIds,
+                                vertsAdded = fixedEntry.chunkMap[key].vertsAdded,
+                                isFixed = true,
+                                lodLevel = fixedEntry.lodLevel,
+                        }
+                        return true
+                end
+
+                ensureCapsCached(fixedEntry); ensureFaceIds(fixedEntry, opts)
+                local existing = fixedEntry.chunkMap and fixedEntry.chunkMap[key]
+                if existing and existing.faceIds then
+                        removeFaces(fixedEntry, existing.faceIds)
+                        decrementPreciseCount(fixedEntry, existing.lodLevel)
+                        fixedEntry.chunkMap[key] = nil
+                end
+                local pack, err = addFacesInto(fixedEntry)
+                if not pack then
+                        warn("[MeshPool] build failed ", err, " for ", key)
+                        return false
+                end
+                pack.collisionFidelity = opts.CollisionFidelityTarget
+                fixedEntry.triCount = #pack.faceIds
+                fixedEntry.vertCount = pack.vertsAdded or 0
+                pack.lodLevel = lodLevel
+                fixedEntry.chunkMap[key] = pack
+                fixedEntry.lodLevel = lodLevel
+                fixedEntry.active = true
+                fixedEntry.collisionFidelity = pack.collisionFidelity
+                incrementPreciseCount(fixedEntry, lodLevel)
+                if fixedEntry.part and fixedEntry.part.Parent == nil then
+                        fixedEntry.part.Parent = ensureFolder()
+                end
+                markDirty(fixedEntry)
+                FIXED_CHUNKS[key] = fixedEntry
+                CHUNK_INDEX[key] = {
+                        entry = fixedEntry,
+                        faceIds = pack.faceIds,
+                        vertsAdded = pack.vertsAdded,
+                        isFixed = true,
+                        lodLevel = lodLevel,
+                }
+                return true
+        elseif not wantFixed and rec and rec.isFixed then
+                -- If we downgraded from fixed to pooled but still have a fixed record,
+                -- release it before continuing.
+                local entry = rec.entry or FIXED_CHUNKS[key]
+                if entry then
+                        releaseFixedEntry(key, entry)
+                end
+                CHUNK_INDEX[key] = nil
+                rec = nil
+        end
 
 	local recEntry = rec and (rec.entry or POOL[rec.poolIdx]) or nil
 	local entry, poolIdx
@@ -683,77 +899,10 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 		ensureCapsCached(entry); ensureFaceIds(entry, opts)
 	end
 
-	local function addFacesInto(e)
-		local newFaceIds = table.create(trisNeeded)
-		local vertsAdded = 0
-
-		if flatShade then
-			for _,t in ipairs(srcTris) do
-				local a,b,c = t[1], t[2], t[3]
-				local p1,p2,p3 = srcVerts[a], srcVerts[b], srcVerts[c]
-				if p1 and p2 and p3 then
-					local area2 = (p2 - p1):Cross(p3 - p1).Magnitude
-					if area2 >= 5e-10 then
-						local ok1,v1 = pcall(function() return e.em:AddVertex(p1) end)
-						local ok2,v2 = pcall(function() return e.em:AddVertex(p2) end)
-						local ok3,v3 = pcall(function() return e.em:AddVertex(p3) end)
-						if not (ok1 and ok2 and ok3 and v1 and v2 and v3) then
-							return nil, "vertex_add_failed"
-						end
-						vertsAdded += 3
-						if e.canSetNormal then
-							local n = triNormal(p1,p2,p3)
-							pcall(function()
-								e.em:SetVertexNormal(v1, n); e.em:SetVertexNormal(v2, n); e.em:SetVertexNormal(v3, n)
-							end)
-						end
-						local okF, fid = pcall(function() return e.em:AddTriangle(v1, v2, v3) end)
-						if not (okF and fid) then return nil, "face_add_failed" end
-						colorFace(e, fid, p1,p2,p3, opts)
-						newFaceIds[#newFaceIds+1] = fid
-						if doubleSided then
-							local okB, fidB = pcall(function() return e.em:AddTriangle(v3, v2, v1) end)
-							if okB and fidB then
-								colorFace(e, fidB, p3,p2,p1, opts)
-								newFaceIds[#newFaceIds+1] = fidB
-							else
-								return nil, "face_add_failed"
-							end
-						end
-					end
-				end
-			end
-		else
-			for _,t in ipairs(srcTris) do
-				local a,b,c = t[1], t[2], t[3]
-				local fid, okF = nil, nil
-				local p1,p2,p3 = srcVerts[a], srcVerts[b], srcVerts[c]
-				if p1 and p2 and p3 then
-					local okAdd, faceId = pcall(function() return e.em:AddTriangle(p1, p2, p3) end)
-					if not (okAdd and faceId) then return nil, "face_add_failed" end
-					fid = faceId
-					colorFace(e, fid, p1,p2,p3, opts)
-					newFaceIds[#newFaceIds+1] = fid
-					if doubleSided then
-						local okB, fidB = pcall(function() return e.em:AddTriangle(p3, p2, p1) end)
-						if okB and fidB then
-							colorFace(e, fidB, p3,p2,p1, opts)
-							newFaceIds[#newFaceIds+1] = fidB
-						else
-							return nil, "face_add_failed"
-						end
-					end
-				end
-			end
-		end
-
-		return { faceIds = newFaceIds, vertsAdded = vertsAdded }
-	end
-
-	local pack, err = addFacesInto(entry)
-	if not pack then
-		local old = entry
-		local newVertCount = 0
+        local pack, err = addFacesInto(entry)
+        if not pack then
+                local old = entry
+                local newVertCount = 0
 		for _,info in pairs(old.chunkMap) do
 			newVertCount += (info.vertsAdded or 0)
 		end
@@ -825,14 +974,11 @@ function MeshPool.unloadChunk(key)
 		return false
 	end
 
-	if rec.isFixed then
-		entry.active = false
-		if entry.part then
-			entry.part.Parent = nil
-		end
-		CHUNK_INDEX[key] = nil
-		return true
-	end
+        if rec.isFixed then
+                releaseFixedEntry(key, entry)
+                CHUNK_INDEX[key] = nil
+                return true
+        end
 
 	local removed = removeFaces(entry, rec.faceIds)
 	entry.triCount  = math.max(0, (entry.triCount or 0)  - removed)
@@ -854,12 +1000,16 @@ end
 function MeshPool.init(cfg)
 	if _initialized then return end
 	cfg = cfg or {}; _lastCfg = table.clone and table.clone(cfg) or cfg
-	TRI_CAP  = math.max(1000, cfg.TriCap or TRI_CAP)
-	MAX_PRECISE_PER_ENTRY = math.max(1, cfg.MaxPrecisePerEntry or MAX_PRECISE_PER_ENTRY)
-	local poolSize = math.max(1, cfg.PoolSize or 12)
-	MAX_PRECISE_POOL_SLOTS = math.clamp(cfg.PrecisePoolLimit or MAX_PRECISE_POOL_SLOTS, 1, poolSize)
-	ensureFolder()
-	FIXED_CHUNKS = {}
+        TRI_CAP  = math.max(1000, cfg.TriCap or TRI_CAP)
+        MAX_PRECISE_PER_ENTRY = math.max(1, cfg.MaxPrecisePerEntry or MAX_PRECISE_PER_ENTRY)
+        MAX_FIXED_ENTRIES = math.max(0, cfg.MaxFixedEntries or MAX_FIXED_ENTRIES)
+        local poolSize = math.max(1, cfg.PoolSize or 12)
+        MAX_PRECISE_POOL_SLOTS = math.clamp(cfg.PrecisePoolLimit or MAX_PRECISE_POOL_SLOTS, 1, poolSize)
+        ensureFolder()
+        FIXED_CHUNKS = {}
+        FIXED_FREE = {}
+        FIXED_CREATED = 0
+        FIXED_ID_SEQ = 0
 
 	for i = 1, poolSize do
 		local okEm, em = pcall(function()
