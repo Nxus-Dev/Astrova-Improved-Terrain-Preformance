@@ -7,19 +7,17 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local MeshPool = require(ReplicatedStorage.Modules.MeshPool)
 
 -- Initialize once (tune if needed)
--- Initialize the MeshPool with a smaller pool size to reduce memory usage.  A
--- large pool of EditableMeshes can exceed Roblox's memory budget and cause
--- CreateEditableMesh to fail.  Reducing PoolSize from 16 to 8 alleviates
--- those limits while still providing enough capacity for streaming terrain.
--- Increase pool size to allow more independent pooled meshes.  Having more
--- entries lets us distribute nearby chunks across different EditableMeshes,
--- improving collision accuracy for PreciseConvexDecomposition chunks.  The
--- TriCap remains the same; vertex cap is handled internally.
+-- Limit the pool size and cap the number of fixed EditableMeshes so we stay
+-- under Roblox's memory budget.  The pool provides shared meshes for nearby
+-- chunks, while fixed entries are now recycled across far LOD chunks to avoid
+-- unbounded CreateEditableMesh calls.  Adjust these numbers if you need more
+-- concurrency, but keep in mind each EditableMesh consumes memory.
 MeshPool.init({
         PoolSize    = 16,
         TriCap      = 19500,
         PrecisePoolLimit = 3,
         MaxPrecisePerEntry = 3,
+        MaxFixedEntries = 8,
         -- Vert cap handled inside MeshPool.lua itself
 })
 
