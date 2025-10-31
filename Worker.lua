@@ -135,7 +135,7 @@ script.Parent:BindToMessage("generateMesh", function(payload)
 	-- Choose per-LOD solid color + shading hint.
 	-- After generating geometry, decide whether to use flat shading based on predicted vertex count.
 	-- Flat shading duplicates vertices per triangle, so if the number of triangles is high, we may exceed
-	-- the EditableMesh vertex limit (˜60k)?782454775832638†screenshot?. Compute the predicted number of
+	-- the EditableMesh vertex limit (60k)?782454775832638screenshot?. Compute the predicted number of
 	-- vertices for flat shading (3 per triangle, or 6 if double-sided) and disable flat shading if
 	-- that would exceed ~55k vertices. This keeps chunks crisp when possible but falls back to smooth
 	-- shading for extremely detailed chunks to avoid build failures.
@@ -147,6 +147,7 @@ script.Parent:BindToMessage("generateMesh", function(payload)
 	local useFlat = (lodLevel <= 0) and (predictedFlatVerts <= 55000)
 	local solidColor = LOD_COLORS[lodLevel] or LOD_COLORS[2]
 	local flatShade  = useFlat
+	local fixedEditable = (lodLevel >= 1)
 
 	-- Hand off to the manager Actor (the only place that touches MeshPool)
 	local managerActor = getManagerActor()
@@ -181,6 +182,8 @@ script.Parent:BindToMessage("generateMesh", function(payload)
 			SolidColor      = solidColor,   -- LOD debug color
 			FlatShade       = flatShade,
 			CollisionFidelityTarget = cfTarget,
+			FixedEditable   = fixedEditable,
+			LODLevel        = lodLevel,
 		},
 		Nonce = nonce,
 	})
