@@ -25,7 +25,7 @@ local MeshPool = {}
 -- necessarily correspond to accuracy.  For example, Hull (1) is less
 -- accurate than Default (0) because Hull produces a single convex hull
 -- while Default voxelizes and may better approximate slopes and concave
--- surfaces?802672436925696†screenshot?.  PreciseConvexDecomposition (3) is the
+-- surfaces?802672436925696screenshot?.  PreciseConvexDecomposition (3) is the
 -- most accurate.  Use this ranking table to select the most accurate
 -- fidelity when aggregating requirements across chunks.
 local CF_RANK = {
@@ -62,6 +62,7 @@ local DEFAULT_FACE_COLOR  = Color3.fromHSV(0.33, 0.70, 0.60)
 -- }
 local POOL = {}
 local CHUNK_INDEX = {}     -- key -> { poolIdx, faceIds = {...}, vertsAdded = N }
+local FIXED_CHUNKS = {}    -- key -> fixed entry record
 
 local PoolFolder
 local _initialized = false
@@ -194,7 +195,7 @@ local function applyPoolMesh(entry)
 	-- Historically this function attempted an in-place ApplyMesh() on the existing
 	-- MeshPart, only falling back to creating a new MeshPart if ApplyMesh failed.
 	-- However, collisions for EditableMesh objects can become out of sync with the
-	-- visual geometry when ApplyMesh is used repeatedly?85239273133226†L54-L67?.  To ensure
+	-- visual geometry when ApplyMesh is used repeatedly?85239273133226L54-L67?.  To ensure
 	-- that the physics geometry matches the new mesh each time, we now always
 	-- create a fresh MeshPart from the generated content. This forces Roblox to
 	-- recalc the collision data and eliminates the slight gap that could be
@@ -210,7 +211,7 @@ local function applyPoolMesh(entry)
 		if cf then
 			-- Use capitalized keys for CreateMeshPartAsync options.  Roblox's
 			-- AssetService expects `CollisionFidelity` and `RenderFidelity`
-			-- rather than lower-case names?870761339834114†L515-L519?.  Passing
+			-- rather than lower-case names?870761339834114L515-L519?.  Passing
 			-- these ensures the resulting MeshPart uses the desired
 			-- collision fidelity and render fidelity.  Without these keys,
 			-- the default (Hull) is used, leading to inaccurate collisions.
@@ -222,7 +223,7 @@ local function applyPoolMesh(entry)
 	local okNew, newPartOrErr = pcall(function()
 		-- Pass options table if a collision fidelity is specified.  Some API
 		-- versions may expect lower-case keys (collisionFidelity), as per
-		-- documentation?870761339834114†L515-L519?.
+		-- documentation?870761339834114L515-L519?.
 		return AssetService:CreateMeshPartAsync(content, createOpts)
 	end)
 	if not okNew or not newPartOrErr then
@@ -376,6 +377,7 @@ end
 
 local function colorFace(entry, fid, p1,p2,p3, opts)
 	if not entry.canFaceColors then return end
+
 	local cid
 	if opts.SolidColor then
 		cid = solidCidFor(entry, opts.SolidColor)
@@ -388,6 +390,23 @@ local function colorFace(entry, fid, p1,p2,p3, opts)
 	end
 	if cid then pcall(function() entry.em:SetFaceColors(fid, {cid, cid, cid}) end) end
 end
+
+local function recomputeCollisionFidelity(entry)
+	if not entry then return end
+	local highest = nil
+	local highestRank = -math.huge
+	for _,info in pairs(entry.chunkMap) do
+		if info and info.collisionFidelity then
+			local rank = CF_RANK[info.collisionFidelity] or -math.huge
+			if rank > highestRank then
+				highest = info.collisionFidelity
+				highestRank = rank
+			end
+		end
+	end
+	entry.collisionFidelity = highest
+end
+
 
 local function requiredVerts(triCount, uniqueVerts, flatShade, doubleSided)
 	if flatShade then
@@ -428,6 +447,47 @@ local function pickPoolForPrecise(trisNeed, vertsNeed)
 	return nil
 end
 
+local function createFixedEntry(key)
+	local okEm, em = pcall(function()
+		return AssetService:CreateEditableMesh({ FixedSize = true })
+	end)
+	if not okEm or not em then
+		warn("[MeshPool] CreateEditableMesh (fixed) failed: ", tostring(em))
+		return nil
+	end
+
+	local part = Instance.new("MeshPart")
+	part.Name = ("FixedChunk_%s"):format(key)
+	part.Anchored = true
+	part.CastShadow = true
+	part.Material = Enum.Material.SmoothPlastic
+	part.Color = FALLBACK_PART_COLOR
+	part.CFrame = CFrame.new()
+	part.CanCollide = true
+	pcall(function() part.UsePartColor = false end)
+	part.Parent = ensureFolder()
+
+	local entry = {
+		em = em,
+		part = part,
+		triCount = 0,
+		vertCount = 0,
+		chunkMap = {},
+		palette = nil,
+		defaultCid = nil,
+		canSetNormal = nil,
+		canFaceColors = nil,
+		solidCids = {},
+		dirty = false,
+		applying = false,
+		collisionFidelity = nil,
+		isFixed = true,
+		active = true,
+		lodLevel = nil,
+	}
+	return entry
+end
+
 -- ---------- Public API ----------
 function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 	if not _initialized or #POOL == 0 then
@@ -437,14 +497,13 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 	if type(srcTris)  ~= "table" or #srcTris  == 0 then return false end
 
 	opts = opts or {}
+	local wantFixed = opts.FixedEditable == true
+	local lodLevel = opts.LODLevel
 	local doubleSided = opts.DoubleSided == true
 	local flatShade   = opts.FlatShade == true
 	local trisNeeded  = #srcTris * (doubleSided and 2 or 1)
 	local vertsNeeded = requiredVerts(#srcTris, #srcVerts, flatShade, doubleSided)
 
-	-- Determine if this chunk requests PreciseConvexDecomposition collision.  Such
-	-- chunks will be spread across pool entries using pickPoolForPrecise() to
-	-- improve collision fidelity by avoiding multi-chunk aggregation.
 	local isPrecise = false
 	do
 		local cf = opts.CollisionFidelityTarget
@@ -453,15 +512,99 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 		end
 	end
 
-	-- choose target pool (reuse if replacing in the same pool).  For precise
-	-- collision chunks, use pickPoolForPrecise() to cycle through entries.
 	local rec = CHUNK_INDEX[key]
-	local entry, poolIdx
+	if rec and rec.isFixed and not wantFixed then
+		local fixedEntry = rec.entry or FIXED_CHUNKS[key]
+		if fixedEntry then
+			local existing = fixedEntry.chunkMap and fixedEntry.chunkMap[key]
+			if existing and existing.faceIds then
+				removeFaces(fixedEntry, existing.faceIds)
+			end
+			FIXED_CHUNKS[key] = nil
+			if fixedEntry.part then fixedEntry.part:Destroy() end
+			pcall(function() if fixedEntry.em then fixedEntry.em:Destroy() end end)
+		end
+		CHUNK_INDEX[key] = nil
+		rec = nil
+	end
 
-	if rec and POOL[rec.poolIdx] then
-		entry = POOL[rec.poolIdx]; poolIdx = rec.poolIdx
+	if wantFixed then
+		if rec and not rec.isFixed then
+			local dynEntry = rec.entry or POOL[rec.poolIdx]
+			if dynEntry then
+				local removedFaces = removeFaces(dynEntry, rec.faceIds)
+				dynEntry.triCount = math.max(0, (dynEntry.triCount or 0) - removedFaces)
+				dynEntry.vertCount = math.max(0, (dynEntry.vertCount or 0) - (rec.vertsAdded or 0))
+				dynEntry.chunkMap[key] = nil
+				recomputeCollisionFidelity(dynEntry)
+				markDirty(dynEntry)
+			end
+			CHUNK_INDEX[key] = nil
+			rec = nil
+		end
+		local entry = FIXED_CHUNKS[key]
+		if entry and entry.chunkMap and entry.chunkMap[key] and entry.lodLevel ~= nil and lodLevel ~= nil and entry.lodLevel == lodLevel then
+			entry.active = true
+			if entry.part and entry.part.Parent == nil then
+				entry.part.Parent = ensureFolder()
+			end
+			CHUNK_INDEX[key] = {
+				entry = entry,
+				faceIds = entry.chunkMap[key].faceIds,
+				vertsAdded = entry.chunkMap[key].vertsAdded,
+				isFixed = true,
+				lodLevel = entry.lodLevel,
+			}
+			return true
+		end
+		if not entry then
+			entry = createFixedEntry(key)
+			if not entry then
+				return false
+			end
+			FIXED_CHUNKS[key] = entry
+		else
+			local existing = entry.chunkMap and entry.chunkMap[key]
+			if existing and existing.faceIds then
+				removeFaces(entry, existing.faceIds)
+			end
+			entry.chunkMap[key] = nil
+			entry.triCount = 0
+			entry.vertCount = 0
+			entry.collisionFidelity = nil
+		end
 		ensureCapsCached(entry); ensureFaceIds(entry, opts)
-		-- If the existing pool won't have room after replacement, try alternate pool.
+		local pack, err = addFacesInto(entry)
+		if not pack then
+			warn("[MeshPool] build failed ", err, " for ", key)
+			return false
+		end
+		pack.collisionFidelity = opts.CollisionFidelityTarget
+		entry.triCount = #pack.faceIds
+		entry.vertCount = pack.vertsAdded or 0
+		entry.chunkMap[key] = pack
+		entry.lodLevel = lodLevel
+		entry.active = true
+		entry.collisionFidelity = pack.collisionFidelity
+		if entry.part and entry.part.Parent == nil then
+			entry.part.Parent = ensureFolder()
+		end
+		markDirty(entry)
+		CHUNK_INDEX[key] = {
+			entry = entry,
+			faceIds = pack.faceIds,
+			vertsAdded = pack.vertsAdded,
+			isFixed = true,
+			lodLevel = lodLevel,
+		}
+		return true
+	end
+
+	local recEntry = rec and (rec.entry or POOL[rec.poolIdx]) or nil
+	local entry, poolIdx
+	if rec and recEntry then
+		entry = recEntry; poolIdx = rec.poolIdx
+		ensureCapsCached(entry); ensureFaceIds(entry, opts)
 		local roomAfter = ((entry.triCount or 0) - #rec.faceIds) + trisNeeded <= TRI_CAP
 		local vertAfter = ((entry.vertCount or 0) - (rec.vertsAdded or 0)) + vertsNeeded <= VERT_CAP
 		if not (roomAfter and vertAfter) then
@@ -520,239 +663,94 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 						colorFace(e, fid, p1,p2,p3, opts)
 						newFaceIds[#newFaceIds+1] = fid
 						if doubleSided then
-							local ok1b,v1b = pcall(function() return e.em:AddVertex(p3) end)
-							local ok2b,v2b = pcall(function() return e.em:AddVertex(p2) end)
-							local ok3b,v3b = pcall(function() return e.em:AddVertex(p1) end)
-							if not (ok1b and ok2b and ok3b and v1b and v2b and v3b) then
-								return nil, "vertex_add_failed"
+							local okB, fidB = pcall(function() return e.em:AddTriangle(v3, v2, v1) end)
+							if okB and fidB then
+								colorFace(e, fidB, p3,p2,p1, opts)
+								newFaceIds[#newFaceIds+1] = fidB
+							else
+								return nil, "face_add_failed"
 							end
-							vertsAdded += 3
-							if e.canSetNormal then
-								local n2 = triNormal(p3,p2,p1)
-								pcall(function()
-									e.em:SetVertexNormal(v1b, n2); e.em:SetVertexNormal(v2b, n2); e.em:SetVertexNormal(v3b, n2)
-								end)
-							end
-							local okFb, fidb = pcall(function() return e.em:AddTriangle(v1b, v2b, v3b) end)
-							if not (okFb and fidb) then return nil, "face_add_failed" end
-							colorFace(e, fidb, p1,p2,p3, opts)
-							newFaceIds[#newFaceIds+1] = fidb
 						end
 					end
 				end
 			end
 		else
-			-- smooth-shaded: add a unique map of vertices first
-			local vmap = table.create(#srcVerts)
-			for i = 1, #srcVerts do
-				local okv, vid = pcall(function() return e.em:AddVertex(srcVerts[i]) end)
-				if not (okv and vid) then return nil, "vertex_add_failed" end
-				vertsAdded += 1; vmap[i] = vid
-			end
 			for _,t in ipairs(srcTris) do
 				local a,b,c = t[1], t[2], t[3]
+				local fid, okF = nil, nil
 				local p1,p2,p3 = srcVerts[a], srcVerts[b], srcVerts[c]
-				local v1,v2,v3 = vmap[a], vmap[b], vmap[c]
-				if p1 and p2 and p3 and v1 and v2 and v3 then
-					local area2 = (p2 - p1):Cross(p3 - p1).Magnitude
-					if area2 >= 5e-10 then
-						if e.canSetNormal then
-							local n = triNormal(p1,p2,p3)
-							pcall(function()
-								e.em:SetVertexNormal(v1, n); e.em:SetVertexNormal(v2, n); e.em:SetVertexNormal(v3, n)
-							end)
-						end
-						local okF, fid = pcall(function() return e.em:AddTriangle(v1, v2, v3) end)
-						if not (okF and fid) then return nil, "face_add_failed" end
-						colorFace(e, fid, p1,p2,p3, opts)
-						newFaceIds[#newFaceIds+1] = fid
-						if doubleSided then
-							local okFb, fidb = pcall(function() return e.em:AddTriangle(v3, v2, v1) end)
-							if not (okFb and fidb) then return nil, "face_add_failed" end
-							colorFace(e, fidb, p1,p2,p3, opts)
-							newFaceIds[#newFaceIds+1] = fidb
+				if p1 and p2 and p3 then
+					local okAdd, faceId = pcall(function() return e.em:AddTriangle(p1, p2, p3) end)
+					if not (okAdd and faceId) then return nil, "face_add_failed" end
+					fid = faceId
+					colorFace(e, fid, p1,p2,p3, opts)
+					newFaceIds[#newFaceIds+1] = fid
+					if doubleSided then
+						local okB, fidB = pcall(function() return e.em:AddTriangle(p3, p2, p1) end)
+						if okB and fidB then
+							colorFace(e, fidB, p3,p2,p1, opts)
+							newFaceIds[#newFaceIds+1] = fidB
+						else
+							return nil, "face_add_failed"
 						end
 					end
 				end
 			end
 		end
-		-- Record whether this chunk should have collisions.  The caller passes
-		-- opts.Collidable to addOrReplaceChunk; we will attach that value later.
-		return {faceIds = newFaceIds, vertsAdded = vertsAdded}
+
+		return { faceIds = newFaceIds, vertsAdded = vertsAdded }
 	end
 
-	-- If replacing in same pool, delete faces first to free room (and account vertex count),
-	-- then add new in the same pool if possible.
-	if rec and POOL[rec.poolIdx] == entry then
-		-- Remove old
-		local removedFaces = removeFaces(entry, rec.faceIds)
-		entry.triCount = math.max(0, (entry.triCount or 0) - removedFaces)
-		entry.vertCount = math.max(0, (entry.vertCount or 0) - (rec.vertsAdded or 0))
-		entry.chunkMap[key] = nil
-		CHUNK_INDEX[key] = nil
-
-		-- Optionally prune unused vertices if getting dense
-		if (entry.vertCount or 0) > REMOVE_UNUSED_NEAR then
-			pcall(function() if entry.em.RemoveUnused then entry.em:RemoveUnused() end end)
-		end
-
-		-- Now add fresh into the same entry (we verified capacity above)
-		local pack, err = addFacesInto(entry)
-		-- Record the collision fidelity target from opts on the pack.  Chunks can
-		-- request different fidelities (e.g. PreciseConvexDecomposition or Hull).
-		if pack then pack.collisionFidelity = opts.CollisionFidelityTarget end
-		if not pack then
-			-- Failed to add due to vertex capacity. Try to compact or switch pools.
-			-- First, attempt to remove unused vertices to free up space.
-			if err == "vertex_add_failed" and entry.em and entry.em.RemoveUnused then
-				pcall(function() entry.em:RemoveUnused() end)
-				-- Recompute vertex count for the entry by summing per-chunk vertsAdded.
-				local newVertCount = 0
-				for _,info in pairs(entry.chunkMap) do
-					newVertCount += (info.vertsAdded or 0)
-				end
-				entry.vertCount = newVertCount
-				-- Try adding again to this entry
-				pack, err = addFacesInto(entry)
-			end
-			-- If still failed, try another pool with more headroom
-			if not pack then
-				-- Pick a different pool (other than current) that can fit requirements
-				local altIdx
-				for i,ent in ipairs(POOL) do
-					if i ~= poolIdx then
-						local roomTri  = (ent.triCount or 0)  + trisNeeded  <= TRI_CAP
-						local roomVert = (ent.vertCount or 0) + vertsNeeded <= VERT_CAP
-						if roomTri and roomVert then altIdx = i; break end
-					end
-				end
-				if altIdx then
-					local altEntry = POOL[altIdx]
-					ensureCapsCached(altEntry); ensureFaceIds(altEntry, opts)
-					pack, err = addFacesInto(altEntry)
-					if pack then
-						entry = altEntry
-						poolIdx = altIdx
-					end
-				end
-			end
-			if not pack then
-				warn("[MeshPool] build failed ", err, " for ", key)
-				return false
-			end
-		end
-		entry.triCount  = (entry.triCount or 0)  + #pack.faceIds
-		entry.vertCount = (entry.vertCount or 0) + (pack.vertsAdded or 0)
-		entry.chunkMap[key] = pack
-		CHUNK_INDEX[key] = { poolIdx = poolIdx, faceIds = pack.faceIds, vertsAdded = pack.vertsAdded }
-		-- Update the aggregated collision fidelity for this entry.  Each chunk may
-		-- request a different fidelity (e.g. PreciseConvexDecomposition or Default).
-		-- We choose the most accurate fidelity based on CF_RANK, not the enum
-		-- numeric Value, because numeric values do not correspond directly to
-		-- accuracy?802672436925696†screenshot?.  If the new pack's fidelity has a higher
-		-- rank than the current entry's fidelity, upgrade.
-		do
-			local target = pack.collisionFidelity
-			if target then
-				local current = entry.collisionFidelity
-				local currentRank = current and CF_RANK[current] or -math.huge
-				local targetRank  = CF_RANK[target] or -math.huge
-				if targetRank > currentRank then
-					entry.collisionFidelity = target
-				end
-			end
-			-- When the new pack does not specify a fidelity, keep the existing.
-		end
-		markDirty(entry)
-		return true
-	end
-
-	-- Different or no existing pool: build in target entry, then remove from old (if any)
 	local pack, err = addFacesInto(entry)
 	if not pack then
-		-- If build fails due to vertex limit, try compaction and pool switch
-		if err == "vertex_add_failed" and entry.em and entry.em.RemoveUnused then
-			pcall(function() entry.em:RemoveUnused() end)
-			-- recompute vertCount after compaction
-			local newVertCount = 0
-			for _,info in pairs(entry.chunkMap) do
-				newVertCount += (info.vertsAdded or 0)
-			end
-			entry.vertCount = newVertCount
-			pack, err = addFacesInto(entry)
+		local old = entry
+		local newVertCount = 0
+		for _,info in pairs(old.chunkMap) do
+			newVertCount += (info.vertsAdded or 0)
 		end
-		if not pack then
-			-- try other pools
-			local altIdx
-			for i,ent in ipairs(POOL) do
-				if i ~= poolIdx then
-					local roomTri  = (ent.triCount or 0)  + trisNeeded  <= TRI_CAP
-					local roomVert = (ent.vertCount or 0) + vertsNeeded <= VERT_CAP
-					if roomTri and roomVert then altIdx = i; break end
-				end
-			end
-			if altIdx then
-				local altEntry = POOL[altIdx]
-				ensureCapsCached(altEntry); ensureFaceIds(altEntry, opts)
-				pack, err = addFacesInto(altEntry)
-				if pack then
-					entry = altEntry
-					poolIdx = altIdx
-				end
+		entry.vertCount = newVertCount
+		pack, err = addFacesInto(entry)
+	end
+	if not pack then
+		local altIdx
+		for i,ent in ipairs(POOL) do
+			if i ~= poolIdx then
+				local roomTri  = (ent.triCount or 0)  + trisNeeded  <= TRI_CAP
+				local roomVert = (ent.vertCount or 0) + vertsNeeded <= VERT_CAP
+				if roomTri and roomVert then altIdx = i; break end
 			end
 		end
-		if not pack then
-			warn("[MeshPool] build failed ", err, " for ", key)
-			return false
+		if altIdx then
+			local altEntry = POOL[altIdx]
+			ensureCapsCached(altEntry); ensureFaceIds(altEntry, opts)
+			pack, err = addFacesInto(altEntry)
+			if pack then
+				entry = altEntry
+				poolIdx = altIdx
+			end
 		end
 	end
-	-- Record the collision fidelity target from opts on the pack.  This must
-	-- happen before updating collisionFidelity aggregation below.
+	if not pack then
+		warn("[MeshPool] build failed ", err, " for ", key)
+		return false
+	end
+
 	if pack then pack.collisionFidelity = opts.CollisionFidelityTarget end
 
 	entry.triCount  = (entry.triCount or 0)  + #pack.faceIds
 	entry.vertCount = (entry.vertCount or 0) + (pack.vertsAdded or 0)
 	entry.chunkMap[key] = pack
-	CHUNK_INDEX[key] = { poolIdx = poolIdx, faceIds = pack.faceIds, vertsAdded = pack.vertsAdded }
-	-- Update the aggregated collision fidelity for this entry.  Use CF_RANK to
-	-- determine which fidelity is most accurate?802672436925696†screenshot?.
-	do
-		local target = pack.collisionFidelity
-		if target then
-			local current = entry.collisionFidelity
-			local currentRank = current and CF_RANK[current] or -math.huge
-			local targetRank  = CF_RANK[target] or -math.huge
-			if targetRank > currentRank then
-				entry.collisionFidelity = target
-			end
-		end
-	end
+	CHUNK_INDEX[key] = { entry = entry, poolIdx = poolIdx, faceIds = pack.faceIds, vertsAdded = pack.vertsAdded, isFixed = false, lodLevel = lodLevel }
+	recomputeCollisionFidelity(entry)
 	markDirty(entry)
 
-	-- If there was an old record in a different pool, remove it now
-	if rec and POOL[rec.poolIdx] and POOL[rec.poolIdx] ~= entry then
-		local old = POOL[rec.poolIdx]
+	if rec and recEntry and recEntry ~= entry then
+		local old = recEntry
 		local removedFaces = removeFaces(old, rec.faceIds)
 		old.triCount  = math.max(0, (old.triCount or 0)  - removedFaces)
 		old.vertCount = math.max(0, (old.vertCount or 0) - (rec.vertsAdded or 0))
 		old.chunkMap[key] = nil
-		-- Recompute the aggregated collision fidelity for the old entry.  After
-		-- removing a chunk, find the most accurate fidelity among the remaining
-		-- packs using CF_RANK?802672436925696†screenshot?.
-		do
-			local highest = nil
-			local highestRank = -math.huge
-			for _,info in pairs(old.chunkMap) do
-				if info and info.collisionFidelity then
-					local rank = CF_RANK[info.collisionFidelity] or -math.huge
-					if rank > highestRank then
-						highest = info.collisionFidelity
-						highestRank = rank
-					end
-				end
-			end
-			old.collisionFidelity = highest
-		end
+		recomputeCollisionFidelity(old)
 		markDirty(old)
 	end
 
@@ -762,10 +760,19 @@ end
 function MeshPool.unloadChunk(key)
 	local rec = CHUNK_INDEX[key]
 	if not rec then return false end
-	local entry = POOL[rec.poolIdx]
+	local entry = rec.entry or (rec.poolIdx and POOL[rec.poolIdx]) or nil
 	if not entry then
 		CHUNK_INDEX[key] = nil
 		return false
+	end
+
+	if rec.isFixed then
+		entry.active = false
+		if entry.part then
+			entry.part.Parent = nil
+		end
+		CHUNK_INDEX[key] = nil
+		return true
 	end
 
 	local removed = removeFaces(entry, rec.faceIds)
@@ -774,23 +781,8 @@ function MeshPool.unloadChunk(key)
 	entry.chunkMap[key] = nil
 	CHUNK_INDEX[key] = nil
 
-	-- After removal, recompute the aggregated collision fidelity for this entry.
-	do
-		local highest = nil
-		local highestRank = -math.huge
-		for _,info in pairs(entry.chunkMap) do
-			if info and info.collisionFidelity then
-				local rank = CF_RANK[info.collisionFidelity] or -math.huge
-				if rank > highestRank then
-					highest = info.collisionFidelity
-					highestRank = rank
-				end
-			end
-		end
-		entry.collisionFidelity = highest
-	end
+	recomputeCollisionFidelity(entry)
 
-	-- Compact when getting dense
 	if (entry.vertCount or 0) > REMOVE_UNUSED_NEAR then
 		pcall(function() if entry.em.RemoveUnused then entry.em:RemoveUnused() end end)
 	end
@@ -805,6 +797,7 @@ function MeshPool.init(cfg)
 	TRI_CAP  = math.max(1000, cfg.TriCap or TRI_CAP)
 	local poolSize = math.max(1, cfg.PoolSize or 12)
 	ensureFolder()
+	FIXED_CHUNKS = {}
 
 	for i = 1, poolSize do
 		local okEm, em = pcall(function()
@@ -839,11 +832,10 @@ function MeshPool.init(cfg)
 			solidCids = {},
 			dirty = false,
 			applying = false,
-			-- The highest collision fidelity required by chunks in this entry.  Each
-			-- pack records its desired CollisionFidelityTarget, and the pool
-			-- aggregates the maximum of these values.  When nil, Roblox uses
-			-- Default fidelity.
 			collisionFidelity = nil,
+			isFixed = false,
+			active = true,
+			lodLevel = nil,
 		}
 	end
 
