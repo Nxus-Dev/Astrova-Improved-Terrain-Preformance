@@ -16,9 +16,11 @@ local MeshPool = require(ReplicatedStorage.Modules.MeshPool)
 -- improving collision accuracy for PreciseConvexDecomposition chunks.  The
 -- TriCap remains the same; vertex cap is handled internally.
 MeshPool.init({
-	PoolSize    = 16,
-	TriCap      = 19500,
-	-- Vert cap handled inside MeshPool.lua itself
+        PoolSize    = 16,
+        TriCap      = 19500,
+        PrecisePoolLimit = 3,
+        MaxPrecisePerEntry = 3,
+        -- Vert cap handled inside MeshPool.lua itself
 })
 
 -- Markers -----------------------------------------------------------
