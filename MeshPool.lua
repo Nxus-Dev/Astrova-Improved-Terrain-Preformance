@@ -48,6 +48,8 @@ local REMOVE_UNUSED_NEAR = 52000     -- when vertCount exceeds this, prune after
 local APPLY_PER_FRAME   = 3          -- max pooled parts to ApplyMesh each Heartbeat
 local FALLBACK_PART_COLOR = Color3.fromRGB(176,180,176)
 local DEFAULT_FACE_COLOR  = Color3.fromHSV(0.33, 0.70, 0.60)
+local MAX_PRECISE_PER_ENTRY = 3      -- LOD0 chunks per pooled entry
+local MAX_PRECISE_POOL_SLOTS = 3     -- pooled entries available for precise collision chunks
 
 -- ---------- State ----------
 -- entry = {
@@ -67,6 +69,41 @@ local FIXED_CHUNKS = {}    -- key -> fixed entry record
 local PoolFolder
 local _initialized = false
 local _lastCfg = nil
+
+local function clampPreciseIndex()
+	local limit = math.min(#POOL, MAX_PRECISE_POOL_SLOTS)
+	if limit <= 0 then
+		nextPrecisePoolIndex = 1
+		return
+	end
+	if nextPrecisePoolIndex < 1 or nextPrecisePoolIndex > limit then
+		nextPrecisePoolIndex = 1
+	end
+end
+
+local function isPreciseLOD(lodLevel)
+	if typeof(lodLevel) ~= "number" then
+		return false
+	end
+	return lodLevel <= 0
+end
+
+local function incrementPreciseCount(entry, lodLevel)
+	if not entry then return end
+	if not isPreciseLOD(lodLevel) then return end
+	entry.preciseCount = (entry.preciseCount or 0) + 1
+end
+
+local function decrementPreciseCount(entry, lodLevel)
+	if not entry then return end
+	if not isPreciseLOD(lodLevel) then return end
+	local current = entry.preciseCount or 0
+	if current <= 0 then
+		entry.preciseCount = 0
+	else
+		entry.preciseCount = current - 1
+	end
+end
 
 -- ---------- Utils ----------
 local function ensureFolder()
@@ -433,14 +470,20 @@ end
 -- multiple entries.  Returns nil if no entry has sufficient room.
 local function pickPoolForPrecise(trisNeed, vertsNeed)
 	if #POOL == 0 then return nil end
+	local limit = math.min(#POOL, MAX_PRECISE_POOL_SLOTS)
+	if limit <= 0 then return nil end
+	if nextPrecisePoolIndex > limit then
+		nextPrecisePoolIndex = 1
+	end
 	local start = nextPrecisePoolIndex
-	for attempt = 0, #POOL - 1 do
-		local idx = ((start - 1 + attempt) % #POOL) + 1
+	for attempt = 0, limit - 1 do
+		local idx = ((start - 1 + attempt) % limit) + 1
 		local entry = POOL[idx]
 		local roomTri  = (entry.triCount or 0)  + trisNeed  <= TRI_CAP
 		local roomVert = (entry.vertCount or 0) + vertsNeed <= VERT_CAP
-		if roomTri and roomVert then
-			nextPrecisePoolIndex = (idx % #POOL) + 1
+		local preciseRoom = (entry.preciseCount or 0) < MAX_PRECISE_PER_ENTRY
+		if roomTri and roomVert and preciseRoom then
+			nextPrecisePoolIndex = (idx % limit) + 1
 			return idx
 		end
 	end
@@ -484,6 +527,7 @@ local function createFixedEntry(key)
 		isFixed = true,
 		active = true,
 		lodLevel = nil,
+		preciseCount = 0,
 	}
 	return entry
 end
@@ -519,6 +563,7 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 			local existing = fixedEntry.chunkMap and fixedEntry.chunkMap[key]
 			if existing and existing.faceIds then
 				removeFaces(fixedEntry, existing.faceIds)
+				decrementPreciseCount(fixedEntry, existing.lodLevel or rec.lodLevel)
 			end
 			FIXED_CHUNKS[key] = nil
 			if fixedEntry.part then fixedEntry.part:Destroy() end
@@ -538,6 +583,7 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 				dynEntry.chunkMap[key] = nil
 				recomputeCollisionFidelity(dynEntry)
 				markDirty(dynEntry)
+				decrementPreciseCount(dynEntry, rec.lodLevel)
 			end
 			CHUNK_INDEX[key] = nil
 			rec = nil
@@ -567,6 +613,7 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 			local existing = entry.chunkMap and entry.chunkMap[key]
 			if existing and existing.faceIds then
 				removeFaces(entry, existing.faceIds)
+				decrementPreciseCount(entry, existing.lodLevel)
 			end
 			entry.chunkMap[key] = nil
 			entry.triCount = 0
@@ -582,10 +629,12 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 		pack.collisionFidelity = opts.CollisionFidelityTarget
 		entry.triCount = #pack.faceIds
 		entry.vertCount = pack.vertsAdded or 0
+		pack.lodLevel = lodLevel
 		entry.chunkMap[key] = pack
 		entry.lodLevel = lodLevel
 		entry.active = true
 		entry.collisionFidelity = pack.collisionFidelity
+		incrementPreciseCount(entry, lodLevel)
 		if entry.part and entry.part.Parent == nil then
 			entry.part.Parent = ensureFolder()
 		end
@@ -715,9 +764,12 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 		local altIdx
 		for i,ent in ipairs(POOL) do
 			if i ~= poolIdx then
-				local roomTri  = (ent.triCount or 0)  + trisNeeded  <= TRI_CAP
-				local roomVert = (ent.vertCount or 0) + vertsNeeded <= VERT_CAP
-				if roomTri and roomVert then altIdx = i; break end
+				if (not isPrecise) or (i <= math.min(#POOL, MAX_PRECISE_POOL_SLOTS)) then
+					local roomTri  = (ent.triCount or 0)  + trisNeeded  <= TRI_CAP
+					local roomVert = (ent.vertCount or 0) + vertsNeeded <= VERT_CAP
+					local preciseRoom = (not isPrecise) or ((ent.preciseCount or 0) < MAX_PRECISE_PER_ENTRY)
+					if roomTri and roomVert and preciseRoom then altIdx = i; break end
+				end
 			end
 		end
 		if altIdx then
@@ -737,9 +789,16 @@ function MeshPool.addOrReplaceChunk(key, srcVerts, srcTris, opts)
 
 	if pack then pack.collisionFidelity = opts.CollisionFidelityTarget end
 
+	local previousEntry = recEntry
+	if rec and previousEntry then
+		decrementPreciseCount(previousEntry, rec.lodLevel)
+	end
+
 	entry.triCount  = (entry.triCount or 0)  + #pack.faceIds
 	entry.vertCount = (entry.vertCount or 0) + (pack.vertsAdded or 0)
+	pack.lodLevel = lodLevel
 	entry.chunkMap[key] = pack
+	incrementPreciseCount(entry, lodLevel)
 	CHUNK_INDEX[key] = { entry = entry, poolIdx = poolIdx, faceIds = pack.faceIds, vertsAdded = pack.vertsAdded, isFixed = false, lodLevel = lodLevel }
 	recomputeCollisionFidelity(entry)
 	markDirty(entry)
@@ -779,6 +838,7 @@ function MeshPool.unloadChunk(key)
 	entry.triCount  = math.max(0, (entry.triCount or 0)  - removed)
 	entry.vertCount = math.max(0, (entry.vertCount or 0) - (rec.vertsAdded or 0))
 	entry.chunkMap[key] = nil
+	decrementPreciseCount(entry, rec.lodLevel)
 	CHUNK_INDEX[key] = nil
 
 	recomputeCollisionFidelity(entry)
@@ -795,7 +855,9 @@ function MeshPool.init(cfg)
 	if _initialized then return end
 	cfg = cfg or {}; _lastCfg = table.clone and table.clone(cfg) or cfg
 	TRI_CAP  = math.max(1000, cfg.TriCap or TRI_CAP)
+	MAX_PRECISE_PER_ENTRY = math.max(1, cfg.MaxPrecisePerEntry or MAX_PRECISE_PER_ENTRY)
 	local poolSize = math.max(1, cfg.PoolSize or 12)
+	MAX_PRECISE_POOL_SLOTS = math.clamp(cfg.PrecisePoolLimit or MAX_PRECISE_POOL_SLOTS, 1, poolSize)
 	ensureFolder()
 	FIXED_CHUNKS = {}
 
@@ -836,10 +898,13 @@ function MeshPool.init(cfg)
 			isFixed = false,
 			active = true,
 			lodLevel = nil,
+			preciseCount = 0,
 		}
 	end
 
 	_initialized = true
+	nextPrecisePoolIndex = 1
+	clampPreciseIndex()
 	print(string.format("[MeshPool] init: %d pools, TriCap=%d, VertCap<=%d", #POOL, TRI_CAP, VERT_CAP))
 end
 
